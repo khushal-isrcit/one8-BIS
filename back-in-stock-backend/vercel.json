@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/notify.js": {
+      "maxDuration": 10
+    }
+  }
+}
