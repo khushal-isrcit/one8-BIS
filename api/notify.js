@@ -7,7 +7,13 @@
  *   or
  *   { email: "someone@example.com", phone?: "+919812345678", productHandle: "seam-xviii-signature-mens" }
  *
- * What it does:
+ * GET /api/notify?productHandle=<handle>&phone=%2B919812345678
+ *   Answers { ok, tag, subscribed } — whether that shopper already holds the
+ *   tag, so the storefront can render the button in its subscribed state on
+ *   load. Read-only: it never creates a customer, and it skips the product
+ *   check, since an unknown handle correctly answers subscribed: false.
+ *
+ * What POST does:
  *   1. Validates the product handle and confirms the product exists.
  *   2. Resolves the customer: by Shopify customer ID (KwikPass logged-in flow),
  *      by email, or by phone (guest flow; the customer is created if not found).
@@ -34,7 +40,12 @@ const DEFAULT_ORIGINS = ["https://one8.com", "https://www.one8.com"];
 
 const REQUEST_TIMEOUT_MS = 6000;
 const MAX_ATTEMPTS = 3;
-const RATE_LIMIT = 10; // requests per IP per window
+// Requests per IP per window. The read-only GET gets a higher allowance: it
+// fires on every sold-out variant view, and shoppers on Indian mobile carriers
+// share NAT addresses, so a handful of them behind one IP would otherwise
+// exhaust the write budget.
+const RATE_LIMIT_WRITE = 10;
+const RATE_LIMIT_READ = 30;
 const RATE_WINDOW_MS = 60_000;
 const SHOPIFY_TAG_MAX = 255;
 
@@ -46,7 +57,7 @@ const SHOPIFY_TAG_MAX = 255;
 // this is a speed bump, not a guarantee. Add Vercel WAF rules for real limits.
 const hits = new Map();
 
-function throttled(ip) {
+function throttled(ip, limit) {
   const now = Date.now();
   const windowStart = now - RATE_WINDOW_MS;
 
@@ -60,7 +71,7 @@ function throttled(ip) {
   const list = (hits.get(ip) || []).filter((t) => t > windowStart);
   list.push(now);
   hits.set(ip, list);
-  return list.length > RATE_LIMIT;
+  return list.length > limit;
 }
 
 function clientIp(req) {
@@ -85,7 +96,7 @@ function applyCors(req, res) {
   const origin = String(req.headers.origin || "").replace(/\/$/, "");
 
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -134,6 +145,22 @@ async function readJsonBody(req) {
   } catch {
     throw new BadRequest("Body must be valid JSON");
   }
+}
+
+/**
+ * Query params as a plain object, so parseInput can take a GET the same way it
+ * takes a JSON body. Vercel populates req.query; the URL fallback keeps this
+ * testable and portable to a plain Node server.
+ */
+function queryOf(req) {
+  if (req.query && typeof req.query === "object") return req.query;
+
+  const params = {};
+  for (const [key, value] of new URL(req.url || "/", "http://localhost").searchParams) {
+    // First occurrence wins, matching how field() unwraps Vercel's arrays.
+    if (!(key in params)) params[key] = value;
+  }
+  return params;
 }
 
 class BadRequest extends Error {
@@ -269,25 +296,39 @@ async function assertProductExists(handle) {
 }
 
 /**
- * Resolve the customer to tag, creating one for guests.
- * @returns {{ gid: string, tags: string[], created: boolean }}
+ * Find an existing customer without creating one. Identity is resolved in
+ * order of trust: Shopify customer ID, then email, then phone — matching how
+ * the storefront widget resolves a Kwikpass shopper.
+ * @returns {Promise<{ gid: string, tags: string[] } | null>}
  */
-async function resolveCustomer({ customerId, email, phone, tag }) {
+async function findCustomer({ customerId, email, phone }) {
   if (customerId) {
-    const gid = `gid://shopify/Customer/${customerId}`;
-    // Verify up front: tagging an unknown ID surfaces as a top-level GraphQL
-    // error, which would otherwise read as a 500 rather than a client error.
-    const data = await adminGraphql(CUSTOMER_BY_ID_QUERY, { id: gid });
-    if (!data.customer) throw new BadRequest("Unknown customer", 404);
-    return { gid: data.customer.id, tags: data.customer.tags || [], created: false };
+    // Look up rather than assume: tagging an unknown ID surfaces as a
+    // top-level GraphQL error, which would otherwise read as a 500.
+    const data = await adminGraphql(CUSTOMER_BY_ID_QUERY, {
+      id: `gid://shopify/Customer/${customerId}`,
+    });
+    if (!data.customer) return null;
+    return { gid: data.customer.id, tags: data.customer.tags || [] };
   }
 
   const q = email ? `email:${searchLiteral(email)}` : `phone:${searchLiteral(phone)}`;
   const found = await adminGraphql(CUSTOMER_SEARCH_QUERY, { q });
-  const existing = found.customers?.edges?.[0]?.node;
-  if (existing) {
-    return { gid: existing.id, tags: existing.tags || [], created: false };
-  }
+  const node = found.customers?.edges?.[0]?.node;
+  return node ? { gid: node.id, tags: node.tags || [] } : null;
+}
+
+/**
+ * Resolve the customer to tag, creating one for guests.
+ * @returns {Promise<{ gid: string, tags: string[], created: boolean }>}
+ */
+async function resolveCustomer({ customerId, email, phone, tag }) {
+  const existing = await findCustomer({ customerId, email, phone });
+  if (existing) return { ...existing, created: false };
+
+  // A customer ID that resolves to nothing is a client error, not a cue to
+  // create an account we have no contact details for.
+  if (customerId) throw new BadRequest("Unknown customer", 404);
 
   const input = { tags: [tag] };
   if (email) input.email = email;
@@ -323,12 +364,29 @@ async function addTag(gid, tag) {
 // Handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Read one field from a JSON body or a parsed query string. A repeated query
+ * param (?phone=a&phone=b) arrives as an array; take the first rather than
+ * stringifying it into "a,b" and failing validation for the wrong reason.
+ */
+function field(source, key) {
+  const value = Array.isArray(source[key]) ? source[key][0] : source[key];
+  return value == null ? "" : String(value);
+}
+
 function parseInput(body) {
-  const productHandle = String(body.productHandle || "").trim().toLowerCase();
-  const customerId = String(body.customerId || "").trim();
-  const email = String(body.email || "").trim().toLowerCase();
+  const productHandle = field(body, "productHandle").trim().toLowerCase();
+  const customerId = field(body, "customerId").trim();
+  const email = field(body, "email").trim().toLowerCase();
+
+  // A "+" in a query string decodes to a space, so an un-encoded
+  // ?phone=+919812345678 arrives as " 919812345678". Repair that exact
+  // signature — a leading space before digits — before stripping separators,
+  // otherwise the number silently loses its country-code marker and 400s.
+  let rawPhone = field(body, "phone");
+  if (/^\s+\d/.test(rawPhone)) rawPhone = `+${rawPhone.trim()}`;
   // Strip spaces, dashes and brackets so "+91 98123-45678" normalises cleanly.
-  const phone = String(body.phone || "").trim().replace(/[\s()\-.]/g, "");
+  const phone = rawPhone.trim().replace(/[\s()\-.]/g, "");
 
   if (!HANDLE_RE.test(productHandle)) throw new BadRequest("Invalid product handle");
   if (!customerId && !email && !phone) {
@@ -353,8 +411,9 @@ export default async function handler(req, res) {
     res.status(originAllowed ? 204 : 403).end();
     return;
   }
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST, OPTIONS");
+  const isRead = req.method === "GET";
+  if (req.method !== "POST" && !isRead) {
+    res.setHeader("Allow", "GET, POST, OPTIONS");
     res.status(405).json({ ok: false, error: "Method not allowed" });
     return;
   }
@@ -362,13 +421,29 @@ export default async function handler(req, res) {
     res.status(403).json({ ok: false, error: "Origin not allowed" });
     return;
   }
-  if (throttled(clientIp(req))) {
+  if (throttled(clientIp(req), isRead ? RATE_LIMIT_READ : RATE_LIMIT_WRITE)) {
     res.setHeader("Retry-After", "60");
     res.status(429).json({ ok: false, error: "Too many requests" });
     return;
   }
 
   try {
+    // ---- GET: has this customer already subscribed? ----------------------
+    if (isRead) {
+      const { tag, customerId, email, phone } = parseInput(queryOf(req));
+      const customer = await findCustomer({ customerId, email, phone });
+
+      // Never cache: the answer is per-customer and changes on subscribe.
+      res.setHeader("Cache-Control", "no-store");
+      res.status(200).json({
+        ok: true,
+        tag,
+        subscribed: Boolean(customer?.tags.includes(tag)),
+      });
+      return;
+    }
+
+    // ---- POST: subscribe -------------------------------------------------
     const body = await readJsonBody(req);
     const { productHandle, customerId, email, phone, tag } = parseInput(body);
 
