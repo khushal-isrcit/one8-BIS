@@ -3,14 +3,14 @@
  *
  * POST /api/notify
  * Body (JSON):
- *   { customerId: "24789358182560", phone?: "+91 98...", productHandle: "seam-xviii-signature-mens" }
+ *   { customerId: "24789358182560", phone?: "+919812345678", productHandle: "seam-xviii-signature-mens" }
  *   or
- *   { email: "someone@example.com", productHandle: "seam-xviii-signature-mens" }
+ *   { email: "someone@example.com", phone?: "+919812345678", productHandle: "seam-xviii-signature-mens" }
  *
  * What it does:
  *   1. Validates the product handle and confirms the product exists.
- *   2. Resolves the customer: by Shopify customer ID (KwikPass logged-in flow)
- *      or by email (guest flow; the customer is created if not found).
+ *   2. Resolves the customer: by Shopify customer ID (KwikPass logged-in flow),
+ *      by email, or by phone (guest flow; the customer is created if not found).
  *   3. Adds the tag `bis-<product-handle>` to that customer via the Admin API.
  *
  * The backend/email team keys their automations off that tag. When a product
@@ -28,64 +28,188 @@ const API_VERSION = "2025-07";
 const TAG_PREFIX = "bis-";
 const HANDLE_RE = /^[a-z0-9][a-z0-9-_]{0,120}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const E164_RE = /^\+[1-9]\d{7,14}$/;
 
 const DEFAULT_ORIGINS = ["https://one8.com", "https://www.one8.com"];
+
+const REQUEST_TIMEOUT_MS = 6000;
+const MAX_ATTEMPTS = 3;
+const RATE_LIMIT = 10; // requests per IP per window
+const RATE_WINDOW_MS = 60_000;
+const SHOPIFY_TAG_MAX = 255;
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
 
 // Very light per-instance throttle. Serverless instances are ephemeral, so
 // this is a speed bump, not a guarantee. Add Vercel WAF rules for real limits.
 const hits = new Map();
+
 function throttled(ip) {
   const now = Date.now();
-  const windowStart = now - 60_000;
+  const windowStart = now - RATE_WINDOW_MS;
+
+  // Prune stale IPs so a long-lived warm instance does not grow unbounded.
+  if (hits.size > 5000) {
+    for (const [key, times] of hits) {
+      if (!times.length || times[times.length - 1] <= windowStart) hits.delete(key);
+    }
+  }
+
   const list = (hits.get(ip) || []).filter((t) => t > windowStart);
   list.push(now);
   hits.set(ip, list);
-  return list.length > 10;
+  return list.length > RATE_LIMIT;
 }
 
+function clientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || String(req.headers["x-real-ip"] || "").trim() || "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
 function allowedOrigins() {
-  const raw = process.env.ALLOWED_ORIGINS || "";
-  const parsed = raw
+  const parsed = String(process.env.ALLOWED_ORIGINS || "")
     .split(",")
-    .map((o) => o.trim())
+    .map((o) => o.trim().replace(/\/$/, ""))
     .filter(Boolean);
   return parsed.length ? parsed : DEFAULT_ORIGINS;
 }
 
+/** @returns {boolean} whether the request origin is permitted. */
 function applyCors(req, res) {
-  const origin = req.headers.origin || "";
-  if (allowedOrigins().includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
+  const origin = String(req.headers.origin || "").replace(/\/$/, "");
+
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Server-to-server calls (curl, Shopify Flow, health checks) send no Origin.
+  if (!origin) return true;
+
+  if (allowedOrigins().includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    return true;
+  }
+  return false;
 }
 
-async function adminGraphql(query, variables) {
+// ---------------------------------------------------------------------------
+// Request body
+// ---------------------------------------------------------------------------
+
+/**
+ * Vercel only pre-parses the body when Content-Type is exactly application/json.
+ * Storefront `fetch` calls (and `sendBeacon`) often send text/plain, so fall
+ * back to reading and parsing the raw stream ourselves.
+ */
+async function readJsonBody(req) {
+  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+
+  let raw = req.body;
+  if (raw == null) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > 100_000) throw new BadRequest("Payload too large");
+      chunks.push(chunk);
+    }
+    raw = Buffer.concat(chunks);
+  }
+
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+  if (!text.trim()) return {};
+
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    throw new BadRequest("Body must be valid JSON");
+  }
+}
+
+class BadRequest extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shopify Admin API
+// ---------------------------------------------------------------------------
+
+/** Escape a value for embedding in a Shopify search query string. */
+function searchLiteral(value) {
+  return `"${String(value).replace(/[\\"]/g, "\\$&")}"`;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isThrottled(errors) {
+  return (errors || []).some(
+    (e) => e?.extensions?.code === "THROTTLED" || /throttl/i.test(e?.message || ""),
+  );
+}
+
+async function adminGraphql(query, variables, attempt = 1) {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!domain || !token) {
     throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN");
   }
 
-  const response = await fetch(
-    `https://${domain}/admin/api/${API_VERSION}/graphql.json`,
-    {
+  let response;
+  try {
+    response = await fetch(`https://${domain}/admin/api/${API_VERSION}/graphql.json`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": token,
       },
       body: JSON.stringify({ query, variables }),
-    },
-  );
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // Network failure or timeout — worth one more shot.
+    if (attempt < MAX_ATTEMPTS) {
+      await sleep(300 * attempt);
+      return adminGraphql(query, variables, attempt + 1);
+    }
+    throw new Error(`Admin API unreachable: ${error.message}`);
+  }
 
-  const json = await response.json();
+  // 429/5xx: back off and retry, honouring Retry-After when present.
+  if ((response.status === 429 || response.status >= 500) && attempt < MAX_ATTEMPTS) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 400 * attempt);
+    return adminGraphql(query, variables, attempt + 1);
+  }
+
+  let json;
+  try {
+    json = await response.json();
+  } catch {
+    throw new Error(`Admin API returned non-JSON (HTTP ${response.status})`);
+  }
+
+  // Shopify signals cost-limit throttling with HTTP 200 + errors[].
+  if (json.errors && isThrottled(json.errors) && attempt < MAX_ATTEMPTS) {
+    await sleep(500 * attempt);
+    return adminGraphql(query, variables, attempt + 1);
+  }
+
   if (!response.ok || json.errors) {
     throw new Error(
-      `Admin API error: ${JSON.stringify(json.errors || json)}`.slice(0, 500),
+      `Admin API error (HTTP ${response.status}): ${JSON.stringify(json.errors || json)}`.slice(0, 500),
     );
   }
   return json.data;
@@ -99,10 +223,16 @@ const PRODUCT_QUERY = `
   }
 `;
 
-const CUSTOMER_BY_EMAIL_QUERY = `
-  query customerByEmail($q: String!) {
+const CUSTOMER_BY_ID_QUERY = `
+  query customerById($id: ID!) {
+    customer(id: $id) { id tags }
+  }
+`;
+
+const CUSTOMER_SEARCH_QUERY = `
+  query customerSearch($q: String!) {
     customers(first: 1, query: $q) {
-      edges { node { id email } }
+      edges { node { id tags } }
     }
   }
 `;
@@ -125,105 +255,144 @@ const TAGS_ADD_MUTATION = `
   }
 `;
 
+// ---------------------------------------------------------------------------
+// Domain steps
+// ---------------------------------------------------------------------------
+
+async function assertProductExists(handle) {
+  const data = await adminGraphql(PRODUCT_QUERY, { q: `handle:${searchLiteral(handle)}` });
+  const node = data.products?.edges?.[0]?.node;
+  // Shopify search is fuzzy; require an exact handle match.
+  if (!node || node.handle !== handle) {
+    throw new BadRequest("Unknown product", 404);
+  }
+}
+
+/**
+ * Resolve the customer to tag, creating one for guests.
+ * @returns {{ gid: string, tags: string[], created: boolean }}
+ */
+async function resolveCustomer({ customerId, email, phone, tag }) {
+  if (customerId) {
+    const gid = `gid://shopify/Customer/${customerId}`;
+    // Verify up front: tagging an unknown ID surfaces as a top-level GraphQL
+    // error, which would otherwise read as a 500 rather than a client error.
+    const data = await adminGraphql(CUSTOMER_BY_ID_QUERY, { id: gid });
+    if (!data.customer) throw new BadRequest("Unknown customer", 404);
+    return { gid: data.customer.id, tags: data.customer.tags || [], created: false };
+  }
+
+  const q = email ? `email:${searchLiteral(email)}` : `phone:${searchLiteral(phone)}`;
+  const found = await adminGraphql(CUSTOMER_SEARCH_QUERY, { q });
+  const existing = found.customers?.edges?.[0]?.node;
+  if (existing) {
+    return { gid: existing.id, tags: existing.tags || [], created: false };
+  }
+
+  const input = { tags: [tag] };
+  if (email) input.email = email;
+  if (phone) input.phone = phone;
+
+  const created = await adminGraphql(CUSTOMER_CREATE_MUTATION, { input });
+  const errors = created.customerCreate?.userErrors || [];
+  if (errors.length) {
+    // A phone/email that another customer already owns loses the race with a
+    // concurrent signup; treat it as a client error rather than a crash.
+    if (errors.some((e) => /taken|already/i.test(e.message || ""))) {
+      throw new BadRequest("Customer already exists with different details", 409);
+    }
+    throw new Error(`customerCreate: ${JSON.stringify(errors)}`);
+  }
+
+  const node = created.customerCreate?.customer;
+  if (!node) throw new Error("customerCreate returned no customer");
+  // The tag was applied at creation time.
+  return { gid: node.id, tags: [tag], created: true };
+}
+
+async function addTag(gid, tag) {
+  const result = await adminGraphql(TAGS_ADD_MUTATION, { id: gid, tags: [tag] });
+  const errors = result.tagsAdd?.userErrors || [];
+  if (errors.length) {
+    console.error("[bis-notify] tagsAdd userErrors", JSON.stringify(errors));
+    throw new BadRequest("Could not tag customer", 422);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+function parseInput(body) {
+  const productHandle = String(body.productHandle || "").trim().toLowerCase();
+  const customerId = String(body.customerId || "").trim();
+  const email = String(body.email || "").trim().toLowerCase();
+  // Strip spaces, dashes and brackets so "+91 98123-45678" normalises cleanly.
+  const phone = String(body.phone || "").trim().replace(/[\s()\-.]/g, "");
+
+  if (!HANDLE_RE.test(productHandle)) throw new BadRequest("Invalid product handle");
+  if (!customerId && !email && !phone) {
+    throw new BadRequest("customerId, email or phone is required");
+  }
+  if (customerId && !/^\d{5,20}$/.test(customerId)) throw new BadRequest("Invalid customerId");
+  if (email && !EMAIL_RE.test(email)) throw new BadRequest("Invalid email");
+  if (phone && !E164_RE.test(phone)) {
+    throw new BadRequest("Invalid phone, expected E.164 format e.g. +919812345678");
+  }
+
+  const tag = `${TAG_PREFIX}${productHandle}`;
+  if (tag.length > SHOPIFY_TAG_MAX) throw new BadRequest("Product handle too long");
+
+  return { productHandle, customerId, email, phone, tag };
+}
+
 export default async function handler(req, res) {
-  applyCors(req, res);
+  const originAllowed = applyCors(req, res);
 
   if (req.method === "OPTIONS") {
-    res.status(204).end();
+    res.status(originAllowed ? 204 : 403).end();
     return;
   }
   if (req.method !== "POST") {
+    res.setHeader("Allow", "POST, OPTIONS");
     res.status(405).json({ ok: false, error: "Method not allowed" });
     return;
   }
-
-  const ip =
-    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || "unknown";
-  if (throttled(ip)) {
+  if (!originAllowed) {
+    res.status(403).json({ ok: false, error: "Origin not allowed" });
+    return;
+  }
+  if (throttled(clientIp(req))) {
+    res.setHeader("Retry-After", "60");
     res.status(429).json({ ok: false, error: "Too many requests" });
     return;
   }
 
   try {
-    const body = typeof req.body === "object" && req.body ? req.body : {};
-    const productHandle = String(body.productHandle || "")
-      .trim()
-      .toLowerCase();
-    const customerId = String(body.customerId || "").trim();
-    const email = String(body.email || "").trim().toLowerCase();
-
-    if (!HANDLE_RE.test(productHandle)) {
-      res.status(400).json({ ok: false, error: "Invalid product handle" });
-      return;
-    }
-    if (!customerId && !email) {
-      res
-        .status(400)
-        .json({ ok: false, error: "customerId or email is required" });
-      return;
-    }
-    if (customerId && !/^\d{5,20}$/.test(customerId)) {
-      res.status(400).json({ ok: false, error: "Invalid customerId" });
-      return;
-    }
-    if (!customerId && !EMAIL_RE.test(email)) {
-      res.status(400).json({ ok: false, error: "Invalid email" });
-      return;
-    }
+    const body = await readJsonBody(req);
+    const { productHandle, customerId, email, phone, tag } = parseInput(body);
 
     // 1. Confirm the product exists so junk handles never become tags.
-    const productData = await adminGraphql(PRODUCT_QUERY, {
-      q: `handle:${productHandle}`,
+    await assertProductExists(productHandle);
+
+    // 2. Resolve (or create) the customer.
+    const customer = await resolveCustomer({ customerId, email, phone, tag });
+
+    // 3. Add the tag, unless creation already applied it.
+    const alreadyTagged = customer.tags.includes(tag);
+    if (!alreadyTagged) await addTag(customer.gid, tag);
+
+    res.status(200).json({
+      ok: true,
+      tag,
+      created: customer.created,
+      alreadySubscribed: alreadyTagged && !customer.created,
     });
-    const productNode = productData.products.edges[0]?.node;
-    if (!productNode || productNode.handle !== productHandle) {
-      res.status(404).json({ ok: false, error: "Unknown product" });
-      return;
-    }
-
-    const tag = `${TAG_PREFIX}${productHandle}`;
-
-    // 2. Resolve the customer GID.
-    let customerGid = null;
-
-    if (customerId) {
-      customerGid = `gid://shopify/Customer/${customerId}`;
-    } else {
-      const found = await adminGraphql(CUSTOMER_BY_EMAIL_QUERY, {
-        q: `email:${email}`,
-      });
-      const existing = found.customers.edges[0]?.node;
-
-      if (existing) {
-        customerGid = existing.id;
-      } else {
-        const created = await adminGraphql(CUSTOMER_CREATE_MUTATION, {
-          input: { email, tags: [tag] },
-        });
-        const errors = created.customerCreate.userErrors;
-        if (errors && errors.length) {
-          throw new Error(`customerCreate: ${JSON.stringify(errors)}`);
-        }
-        // Tag was applied at creation; done.
-        res.status(200).json({ ok: true, tag, created: true });
-        return;
-      }
-    }
-
-    // 3. Add the tag (idempotent: re-adding an existing tag is a no-op).
-    const tagged = await adminGraphql(TAGS_ADD_MUTATION, {
-      id: customerGid,
-      tags: [tag],
-    });
-    const tagErrors = tagged.tagsAdd.userErrors;
-    if (tagErrors && tagErrors.length) {
-      // Most common cause: the customer ID does not exist on this store.
-      res.status(422).json({ ok: false, error: "Could not tag customer" });
-      return;
-    }
-
-    res.status(200).json({ ok: true, tag });
   } catch (error) {
+    if (error instanceof BadRequest) {
+      res.status(error.status).json({ ok: false, error: error.message });
+      return;
+    }
     console.error("[bis-notify]", error);
     res.status(500).json({ ok: false, error: "Server error" });
   }
