@@ -28,6 +28,10 @@
  *   SHOPIFY_ADMIN_TOKEN   Admin API access token of a custom app with
  *                         read_customers + write_customers (and read_products)
  *   ALLOWED_ORIGINS       optional, comma-separated. Defaults to one8.com.
+ *
+ * NOTE: reading customers also requires the app to be approved for protected
+ * customer data. Without it, every customer query fails with ACCESS_DENIED —
+ * see the hint logged by describeAdminError().
  */
 
 const API_VERSION = "2025-07";
@@ -38,7 +42,13 @@ const E164_RE = /^\+[1-9]\d{7,14}$/;
 
 const DEFAULT_ORIGINS = ["https://one8.com", "https://www.one8.com"];
 
-const REQUEST_TIMEOUT_MS = 6000;
+// One Admin API call may not exceed this...
+const REQUEST_TIMEOUT_MS = 4000;
+// ...and all calls for one invocation may not exceed this. Vercel's default
+// max duration is 10s; blowing through it kills the process before the catch
+// block runs, so the failure surfaces as a 500 with no log line at all. Every
+// retry and backoff is bounded by this budget.
+const FUNCTION_BUDGET_MS = 8500;
 const MAX_ATTEMPTS = 3;
 // Requests per IP per window. The read-only GET gets a higher allowance: it
 // fires on every sold-out variant view, and shoppers on Indian mobile carriers
@@ -187,12 +197,52 @@ function isThrottled(errors) {
   );
 }
 
-async function adminGraphql(query, variables, attempt = 1) {
+/**
+ * Turn Shopify's errors[] into something actionable in the logs. The two
+ * failure modes that look identical from the outside — a missing scope and
+ * missing protected-customer-data approval — need completely different fixes,
+ * so name them explicitly.
+ */
+function describeAdminError(errors) {
+  const list = Array.isArray(errors) ? errors : [];
+  const text = list.map((e) => e?.message || "").join(" | ");
+
+  if (/protected customer data|not approved to access/i.test(text)) {
+    return (
+      "SHOPIFY PROTECTED CUSTOMER DATA NOT APPROVED — the app can read products " +
+      "but not customers. Fix in Shopify admin > Settings > Apps and sales channels > " +
+      "Develop apps > (your app) > API access > Protected customer data access > " +
+      "Request access. Approval is separate from the read_customers scope."
+    );
+  }
+  if (list.some((e) => e?.extensions?.code === "ACCESS_DENIED") || /access denied/i.test(text)) {
+    return (
+      "ACCESS_DENIED — the token lacks a required scope (read_products, " +
+      "read_customers, write_customers). Note that adding a scope invalidates " +
+      "the existing token: reinstall the app and update SHOPIFY_ADMIN_TOKEN."
+    );
+  }
+  return "";
+}
+
+/**
+ * @param {object} ctx - { deadline } shared across every call in one request,
+ *   so retries cannot outlive the function's max duration.
+ */
+async function adminGraphql(query, variables, ctx, attempt = 1) {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!domain || !token) {
     throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN");
   }
+  if (/^https?:\/\//i.test(domain)) {
+    // A full URL here builds an unreachable address and reads as a network
+    // failure, which is a confusing way to learn about a typo.
+    throw new Error("SHOPIFY_STORE_DOMAIN must be a bare host, e.g. shop.myshopify.com");
+  }
+
+  const remaining = ctx.deadline - Date.now();
+  if (remaining <= 0) throw new Error("Admin API time budget exhausted");
 
   let response;
   try {
@@ -203,13 +253,13 @@ async function adminGraphql(query, variables, attempt = 1) {
         "X-Shopify-Access-Token": token,
       },
       body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, remaining)),
     });
   } catch (error) {
-    // Network failure or timeout — worth one more shot.
-    if (attempt < MAX_ATTEMPTS) {
+    // Network failure or timeout — worth one more shot, budget permitting.
+    if (attempt < MAX_ATTEMPTS && ctx.deadline - Date.now() > 1000) {
       await sleep(300 * attempt);
-      return adminGraphql(query, variables, attempt + 1);
+      return adminGraphql(query, variables, ctx, attempt + 1);
     }
     throw new Error(`Admin API unreachable: ${error.message}`);
   }
@@ -217,8 +267,14 @@ async function adminGraphql(query, variables, attempt = 1) {
   // 429/5xx: back off and retry, honouring Retry-After when present.
   if ((response.status === 429 || response.status >= 500) && attempt < MAX_ATTEMPTS) {
     const retryAfter = Number(response.headers.get("retry-after"));
-    await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 400 * attempt);
-    return adminGraphql(query, variables, attempt + 1);
+    const backoff =
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 400 * attempt;
+
+    // Only sleep if there is time left afterwards to actually make the call.
+    if (ctx.deadline - Date.now() > backoff + 1000) {
+      await sleep(backoff);
+      return adminGraphql(query, variables, ctx, attempt + 1);
+    }
   }
 
   let json;
@@ -229,12 +285,19 @@ async function adminGraphql(query, variables, attempt = 1) {
   }
 
   // Shopify signals cost-limit throttling with HTTP 200 + errors[].
-  if (json.errors && isThrottled(json.errors) && attempt < MAX_ATTEMPTS) {
+  if (
+    json.errors &&
+    isThrottled(json.errors) &&
+    attempt < MAX_ATTEMPTS &&
+    ctx.deadline - Date.now() > 1500
+  ) {
     await sleep(500 * attempt);
-    return adminGraphql(query, variables, attempt + 1);
+    return adminGraphql(query, variables, ctx, attempt + 1);
   }
 
   if (!response.ok || json.errors) {
+    const hint = describeAdminError(json.errors);
+    if (hint) console.error("[bis-notify]", hint);
     throw new Error(
       `Admin API error (HTTP ${response.status}): ${JSON.stringify(json.errors || json)}`.slice(0, 500),
     );
@@ -286,8 +349,8 @@ const TAGS_ADD_MUTATION = `
 // Domain steps
 // ---------------------------------------------------------------------------
 
-async function assertProductExists(handle) {
-  const data = await adminGraphql(PRODUCT_QUERY, { q: `handle:${searchLiteral(handle)}` });
+async function assertProductExists(handle, ctx) {
+  const data = await adminGraphql(PRODUCT_QUERY, { q: `handle:${searchLiteral(handle)}` }, ctx);
   const node = data.products?.edges?.[0]?.node;
   // Shopify search is fuzzy; require an exact handle match.
   if (!node || node.handle !== handle) {
@@ -301,19 +364,21 @@ async function assertProductExists(handle) {
  * the storefront widget resolves a Kwikpass shopper.
  * @returns {Promise<{ gid: string, tags: string[] } | null>}
  */
-async function findCustomer({ customerId, email, phone }) {
+async function findCustomer({ customerId, email, phone }, ctx) {
   if (customerId) {
     // Look up rather than assume: tagging an unknown ID surfaces as a
     // top-level GraphQL error, which would otherwise read as a 500.
-    const data = await adminGraphql(CUSTOMER_BY_ID_QUERY, {
-      id: `gid://shopify/Customer/${customerId}`,
-    });
+    const data = await adminGraphql(
+      CUSTOMER_BY_ID_QUERY,
+      { id: `gid://shopify/Customer/${customerId}` },
+      ctx,
+    );
     if (!data.customer) return null;
     return { gid: data.customer.id, tags: data.customer.tags || [] };
   }
 
   const q = email ? `email:${searchLiteral(email)}` : `phone:${searchLiteral(phone)}`;
-  const found = await adminGraphql(CUSTOMER_SEARCH_QUERY, { q });
+  const found = await adminGraphql(CUSTOMER_SEARCH_QUERY, { q }, ctx);
   const node = found.customers?.edges?.[0]?.node;
   return node ? { gid: node.id, tags: node.tags || [] } : null;
 }
@@ -322,8 +387,8 @@ async function findCustomer({ customerId, email, phone }) {
  * Resolve the customer to tag, creating one for guests.
  * @returns {Promise<{ gid: string, tags: string[], created: boolean }>}
  */
-async function resolveCustomer({ customerId, email, phone, tag }) {
-  const existing = await findCustomer({ customerId, email, phone });
+async function resolveCustomer({ customerId, email, phone, tag }, ctx) {
+  const existing = await findCustomer({ customerId, email, phone }, ctx);
   if (existing) return { ...existing, created: false };
 
   // A customer ID that resolves to nothing is a client error, not a cue to
@@ -334,7 +399,7 @@ async function resolveCustomer({ customerId, email, phone, tag }) {
   if (email) input.email = email;
   if (phone) input.phone = phone;
 
-  const created = await adminGraphql(CUSTOMER_CREATE_MUTATION, { input });
+  const created = await adminGraphql(CUSTOMER_CREATE_MUTATION, { input }, ctx);
   const errors = created.customerCreate?.userErrors || [];
   if (errors.length) {
     // A phone/email that another customer already owns loses the race with a
@@ -342,7 +407,8 @@ async function resolveCustomer({ customerId, email, phone, tag }) {
     if (errors.some((e) => /taken|already/i.test(e.message || ""))) {
       throw new BadRequest("Customer already exists with different details", 409);
     }
-    throw new Error(`customerCreate: ${JSON.stringify(errors)}`);
+    console.error("[bis-notify] customerCreate userErrors", JSON.stringify(errors));
+    throw new BadRequest("Could not create customer", 422);
   }
 
   const node = created.customerCreate?.customer;
@@ -351,8 +417,8 @@ async function resolveCustomer({ customerId, email, phone, tag }) {
   return { gid: node.id, tags: [tag], created: true };
 }
 
-async function addTag(gid, tag) {
-  const result = await adminGraphql(TAGS_ADD_MUTATION, { id: gid, tags: [tag] });
+async function addTag(gid, tag, ctx) {
+  const result = await adminGraphql(TAGS_ADD_MUTATION, { id: gid, tags: [tag] }, ctx);
   const errors = result.tagsAdd?.userErrors || [];
   if (errors.length) {
     console.error("[bis-notify] tagsAdd userErrors", JSON.stringify(errors));
@@ -427,19 +493,31 @@ export default async function handler(req, res) {
     return;
   }
 
+  // Shared by every Admin call in this invocation.
+  const ctx = { deadline: Date.now() + FUNCTION_BUDGET_MS };
+
   try {
     // ---- GET: has this customer already subscribed? ----------------------
     if (isRead) {
       const { tag, customerId, email, phone } = parseInput(queryOf(req));
-      const customer = await findCustomer({ customerId, email, phone });
+
+      // A failed lookup must not 500 the product page. The button stays
+      // clickable and the POST is idempotent, so answering "not subscribed"
+      // is the safe degradation.
+      let subscribed = false;
+      let degraded = false;
+      try {
+        const customer = await findCustomer({ customerId, email, phone }, ctx);
+        subscribed = Boolean(customer?.tags.includes(tag));
+      } catch (error) {
+        if (error instanceof BadRequest) throw error;
+        console.error("[bis-notify] status lookup failed", error);
+        degraded = true;
+      }
 
       // Never cache: the answer is per-customer and changes on subscribe.
       res.setHeader("Cache-Control", "no-store");
-      res.status(200).json({
-        ok: true,
-        tag,
-        subscribed: Boolean(customer?.tags.includes(tag)),
-      });
+      res.status(200).json({ ok: true, tag, subscribed, degraded });
       return;
     }
 
@@ -448,14 +526,14 @@ export default async function handler(req, res) {
     const { productHandle, customerId, email, phone, tag } = parseInput(body);
 
     // 1. Confirm the product exists so junk handles never become tags.
-    await assertProductExists(productHandle);
+    await assertProductExists(productHandle, ctx);
 
     // 2. Resolve (or create) the customer.
-    const customer = await resolveCustomer({ customerId, email, phone, tag });
+    const customer = await resolveCustomer({ customerId, email, phone, tag }, ctx);
 
     // 3. Add the tag, unless creation already applied it.
     const alreadyTagged = customer.tags.includes(tag);
-    if (!alreadyTagged) await addTag(customer.gid, tag);
+    if (!alreadyTagged) await addTag(customer.gid, tag, ctx);
 
     res.status(200).json({
       ok: true,
