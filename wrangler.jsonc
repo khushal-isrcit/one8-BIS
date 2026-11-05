@@ -20,16 +20,18 @@
     "enabled": true
   },
 
-  // Plain-text vars. These are re-applied on every deploy, so change them here,
-  // not in the dashboard. SHOPIFY_ADMIN_TOKEN is a secret and is NOT here:
-  // add it in the dashboard (Settings > Variables and Secrets > type Secret).
-  "vars": {
-    "SHOPIFY_STORE_DOMAIN": "6qx7kf-as.myshopify.com",
-    "ALLOWED_ORIGINS": "https://one8.com,https://www.one8.com"
-  },
+  // One codebase, one Worker per store. Store settings are NOT in this file:
+  // each Worker gets them in the dashboard (Settings > Variables and Secrets):
+  //   SHOPIFY_STORE_DOMAIN  text    e.g. 6qx7kf-as.myshopify.com
+  //   ALLOWED_ORIGINS       text    e.g. https://one8.com,https://www.one8.com
+  //   SHOPIFY_ADMIN_TOKEN   secret
+  // keep_vars stops each deploy from wiping the dashboard text vars.
+  "keep_vars": true,
 
   // Per-IP limits, counted per Cloudflare location. namespace_id only has to
   // be unique within the Cloudflare account; period must be 10 or 60.
+  // Rate limits are not inherited by environments, so each store below
+  // repeats them with its own namespace_ids.
   "ratelimits": [
     {
       "name": "NOTIFY_WRITE_LIMITER",
@@ -41,5 +43,27 @@
       "namespace_id": "1802",
       "simple": { "limit": 30, "period": 60 }
     }
-  ]
+  ],
+
+  // The top level above is the one8 India Worker (one8-bis, deploy command
+  // `npx wrangler deploy`). Each extra store is an environment whose name
+  // matches its Worker in the dashboard, deployed with
+  // `npx wrangler deploy --env <key>`.
+  "env": {
+    "global": {
+      "name": "one8-global",
+      "ratelimits": [
+        {
+          "name": "NOTIFY_WRITE_LIMITER",
+          "namespace_id": "1803",
+          "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "NOTIFY_READ_LIMITER",
+          "namespace_id": "1804",
+          "simple": { "limit": 30, "period": 60 }
+        }
+      ]
+    }
+  }
 }

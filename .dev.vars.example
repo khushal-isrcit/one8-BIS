@@ -1,4 +1,6 @@
-# Local secrets for `npm run dev`. Copy to .dev.vars (gitignored).
-# In production, set this in Cloudflare -> Worker -> Settings -> Variables and Secrets
-# as a Secret. SHOPIFY_STORE_DOMAIN and ALLOWED_ORIGINS live in wrangler.jsonc.
+# Local settings for `npm run dev` (add --env global for the global store).
+# Copy to .dev.vars (gitignored). In production these are set per Worker in
+# Cloudflare -> Worker -> Settings -> Variables and Secrets.
+SHOPIFY_STORE_DOMAIN=6qx7kf-as.myshopify.com
+ALLOWED_ORIGINS=https://one8.com,https://www.one8.com
 SHOPIFY_ADMIN_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
