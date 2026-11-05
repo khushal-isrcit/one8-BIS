@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "one8-bis",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-15",
+
+  // public/index.html is served for "/"; anything that is not a file
+  // (e.g. /api/notify, /api/health) falls through to src/index.js.
+  "assets": {
+    "directory": "./public"
+  },
+
+  "workers_dev": true,
+
+  // Keeps console.error output (including the Shopify scope/approval hints)
+  // searchable under the Worker's Logs tab.
+  "observability": {
+    "enabled": true
+  },
+
+  // Plain-text vars. These are re-applied on every deploy, so change them here,
+  // not in the dashboard. SHOPIFY_ADMIN_TOKEN is a secret and is NOT here:
+  // add it in the dashboard (Settings > Variables and Secrets > type Secret).
+  "vars": {
+    "SHOPIFY_STORE_DOMAIN": "6qx7kf-as.myshopify.com",
+    "ALLOWED_ORIGINS": "https://one8.com,https://www.one8.com"
+  },
+
+  // Per-IP limits, counted per Cloudflare location. namespace_id only has to
+  // be unique within the Cloudflare account; period must be 10 or 60.
+  "ratelimits": [
+    {
+      "name": "NOTIFY_WRITE_LIMITER",
+      "namespace_id": "1801",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "NOTIFY_READ_LIMITER",
+      "namespace_id": "1802",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ]
+}
