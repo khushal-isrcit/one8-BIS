@@ -5,8 +5,9 @@
  * GET /api/health?probe=1  -> additionally makes one read-only Admin API call
  *                             to confirm the token and scopes actually work
  *
- * Vars live in wrangler.jsonc; SHOPIFY_ADMIN_TOKEN is a Worker secret set in
- * the Cloudflare dashboard (Settings > Variables and Secrets).
+ * All three store settings are set per Worker in the Cloudflare dashboard
+ * (Settings > Variables and Secrets): SHOPIFY_STORE_DOMAIN, ALLOWED_ORIGINS
+ * (text) and SHOPIFY_ADMIN_TOKEN (secret).
  */
 
 import { empty, json } from "./http.js";
@@ -75,15 +76,20 @@ export async function handleHealth(request, env) {
     // Never echo the token itself — just whether it is present and plausible.
     adminTokenConfigured: Boolean(env.SHOPIFY_ADMIN_TOKEN),
     adminTokenLooksValid: /^shp(at|ca)_[a-f0-9]{32}$/i.test(env.SHOPIFY_ADMIN_TOKEN || ""),
-    allowedOrigins: allowedOrigins.length
-      ? allowedOrigins
-      : ["https://one8.com", "https://www.one8.com (default)"],
+    allowedOrigins,
     rateLimiter: env.NOTIFY_WRITE_LIMITER ? "cloudflare-binding" : "in-memory",
   };
 
-  if (!storeDomain || !body.adminTokenConfigured) {
+  const missing = [
+    !storeDomain && "SHOPIFY_STORE_DOMAIN",
+    !body.adminTokenConfigured && "SHOPIFY_ADMIN_TOKEN",
+    !allowedOrigins.length && "ALLOWED_ORIGINS",
+  ].filter(Boolean);
+
+  if (missing.length) {
     body.ok = false;
-    body.error = "Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN in this environment";
+    body.missing = missing;
+    body.error = `Set ${missing.join(", ")} in Settings > Variables and Secrets`;
   }
 
   if (new URL(request.url).searchParams.get("probe") === "1") {

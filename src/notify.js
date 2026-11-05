@@ -23,13 +23,16 @@
  * is restocked they segment customers with tag `bis-<handle>`, send the email,
  * then remove the tag so customers are not notified twice.
  *
- * Bindings (wrangler.jsonc, plus one dashboard secret):
- *   SHOPIFY_STORE_DOMAIN  var, e.g. 6qx7kf-as.myshopify.com
+ * Per-store settings, set on each Worker in the Cloudflare dashboard
+ * (Settings > Variables and Secrets), so one codebase serves several stores:
+ *   SHOPIFY_STORE_DOMAIN  text, e.g. 6qx7kf-as.myshopify.com
  *   SHOPIFY_ADMIN_TOKEN   secret: Admin API access token of a custom app with
  *                         read_customers + write_customers (and read_products)
- *   ALLOWED_ORIGINS       var, optional, comma-separated. Defaults to one8.com.
- *   NOTIFY_WRITE_LIMITER  optional rate limit bindings; without them the
- *   NOTIFY_READ_LIMITER   in-memory throttle below takes over.
+ *   ALLOWED_ORIGINS       text, comma-separated storefront origins. While it is
+ *                         empty, browser requests are refused.
+ * Rate limit bindings (wrangler.jsonc):
+ *   NOTIFY_WRITE_LIMITER  optional; without them the in-memory throttle
+ *   NOTIFY_READ_LIMITER   below takes over.
  *
  * NOTE: reading customers also requires the app to be approved for protected
  * customer data. Without it, every customer query fails with ACCESS_DENIED —
@@ -43,8 +46,6 @@ const TAG_PREFIX = "bis-";
 const HANDLE_RE = /^[a-z0-9][a-z0-9-_]{0,120}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const E164_RE = /^\+[1-9]\d{7,14}$/;
-
-const DEFAULT_ORIGINS = ["https://one8.com", "https://www.one8.com"];
 
 // One Admin API call may not exceed this...
 const REQUEST_TIMEOUT_MS = 4000;
@@ -117,12 +118,15 @@ function clientIp(request) {
 // CORS
 // ---------------------------------------------------------------------------
 
+/**
+ * No fallback list: this code serves more than one store, so a Worker missing
+ * ALLOWED_ORIGINS must not silently accept another store's storefront.
+ */
 function allowedOrigins(env) {
-  const parsed = String(env.ALLOWED_ORIGINS || "")
+  return String(env.ALLOWED_ORIGINS || "")
     .split(",")
     .map((o) => o.trim().replace(/\/$/, ""))
     .filter(Boolean);
-  return parsed.length ? parsed : DEFAULT_ORIGINS;
 }
 
 /** @returns {{ allowed: boolean, headers: Headers }} */
