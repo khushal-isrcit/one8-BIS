@@ -11,6 +11,8 @@
   },
 
   "workers_dev": true,
+  // No per-version preview URLs: the API should only answer on one hostname.
+  "preview_urls": false,
 
   // Keeps console.error output (including the Shopify scope/approval hints)
   // searchable under the Worker's Logs tab.
